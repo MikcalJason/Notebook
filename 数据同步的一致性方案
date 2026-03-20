@@ -1,0 +1,223 @@
+# ES 数据同步一致性问题 - 经典解决方案
+
+## 问题描述
+MySQL 更新后，ES 中的数据仍是旧值。用户查询得到错误数据。
+
+---
+
+## 四大核心方案
+
+### 1️⃣ 异步消息队列方案（推荐）⭐⭐⭐⭐⭐
+
+**原理**：更新 MySQL → 发送 Kafka 消息 → 消费者更新 ES
+
+**优势**：高性能、高可用、支持重试
+
+**实现**：
+```java
+// 1. 更新时发送消息
+@Transactional
+public void saveOrUpdate(BaseAreas vo) {
+    areasMapper.insertOrUpdate(vo);  // 更新MySQL
+    kafkaTemplate.send("areas-sync", String.valueOf(vo.getId()),
+        JSON.toJSONString(vo));  // 异步发送
+}
+
+// 2. 消费者更新ES
+@KafkaListener(topics = "areas-sync", groupId = "areas-es-group")
+public void syncToES(String message) throws IOException {
+    BaseAreas data = JSON.parseObject(message, BaseAreas.class);
+    IndexRequest req = new IndexRequest("base-areas")
+        .id(String.valueOf(data.getId()))
+        .source(JSON.toJSONString(data), XContentType.JSON);
+    elasticsearchClient.index(req, RequestOptions.DEFAULT);
+}
+```
+
+---
+
+### 2️⃣ 版本号验证方案（防护）⭐⭐⭐⭐
+
+**原理**：查询时对比版本号，发现不一致立即修复
+
+**表结构**：
+```sql
+ALTER TABLE base_areas ADD COLUMN version INT DEFAULT 1;
+```
+
+**实现**：
+```java
+public BaseAreasDTO getById(Long id) {
+    // 查ES
+    BaseAreasDTO esData = getFromES(id);
+
+    // 查MySQL验证版本
+    BaseAreas mysqlData = areasMapper.selectById(id);
+
+    // 版本不一致则以MySQL为准，修复ES
+    if (esData != null && mysqlData != null) {
+        if (!Objects.equals(esData.getVersion(), mysqlData.getVersion())) {
+            updateESAsync(mysqlData);  // 异步修复
+        }
+    }
+    return esData != null ? esData : toDTO(mysqlData);
+}
+```
+
+---
+
+### 3️⃣ 实时降级方案（可用性）⭐⭐⭐⭐
+
+**原理**：ES 故障自动降级到 MySQL，用户无感知
+
+**实现**：
+```java
+public List<BaseAreasDTO> search(String name) {
+    try {
+        // 优先用ES（支持分词，快）
+        return searchFromES(name);
+    } catch (Exception e) {
+        log.warn("ES failed, fallback to MySQL", e);
+        // 降级到MySQL模糊查询（不返回错误，用户无感知）
+        return areasMapper.selectByNameLike("%" + name + "%")
+            .stream().map(this::toDTO).collect(Collectors.toList());
+    }
+}
+```
+
+---
+
+### 4️⃣ CDC 自动同步方案（无侵入）⭐⭐⭐⭐
+
+**原理**：监听 MySQL Binlog，自动捕获变化
+
+**方案**：部署 Canal 服务，无需修改业务代码
+
+**优势**：完全解耦，不入侵业务层
+
+---
+
+## 一致性对比表
+
+| 方案 | 实现成本 | 一致性 | 性能 | 故障恢复 | 适用场景 |
+|-----|--------|-------|------|--------|---------|
+| 异步队列 | ⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | **高并发业务** |
+| 版本号验证 | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | **强一致性** |
+| 实时降级 | ⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | **高可用** |
+| CDC 方案 | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | **大规模系统** |
+
+---
+
+## 推荐组合方案（三层防护）
+
+```
+业务更新
+  ↓
+【第1层】异步 Kafka 同步
+  ├─ 异步更新ES（秒级）
+  └─ 失败存库重试
+
+用户查询
+  ↓
+【第2层】版本号验证+降级
+  ├─ ES 返回数据 + 异步验证
+  ├─ 不一致则修复 ES
+  └─ MySQL 降级兜底
+
+定时任务
+  ↓
+【第3层】全量对账
+  ├─ 每天凌晨对账一次
+  ├─ 发现孤立/不一致数据
+  └─ 监控告警
+```
+
+---
+
+## 失败重试机制
+
+```sql
+-- 失败事件记录表
+CREATE TABLE failed_event_log (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  area_id BIGINT,
+  event_data LONGTEXT,
+  status VARCHAR(20),  -- PENDING/SUCCESS/FAILED
+  retry_count INT DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_status (status),
+  INDEX idx_created_at (created_at)
+);
+```
+
+```java
+// 定时重试（每分钟）
+@Scheduled(fixedDelay = 60000)
+public void retryFailedEvents() {
+    List<FailedEventLog> events = logMapper.selectByStatus("PENDING");
+    for (FailedEventLog event : events) {
+        try {
+            syncToES(event.getEventData());
+            event.setStatus("SUCCESS");
+        } catch (Exception e) {
+            event.setRetryCount(event.getRetryCount() + 1);
+            if (event.getRetryCount() > 3) {
+                event.setStatus("FAILED");
+                alertService.sendAlert("ES同步失败", event.getAreaId());
+            }
+        }
+        logMapper.updateById(event);
+    }
+}
+```
+
+---
+
+## 监控指标
+
+```java
+@Component
+public class ESMetrics {
+    @Autowired private MeterRegistry registry;
+
+    // 记录ES更新耗时
+    public void recordESUpdateTime(long ms) {
+        Timer.builder("es.update.time")
+            .publishPercentiles(0.5, 0.95, 0.99)
+            .register(registry)
+            .record(ms, TimeUnit.MILLISECONDS);
+    }
+
+    // 版本不一致告警
+    public void recordVersionMismatch() {
+        Counter.builder("data.mismatch").register(registry).increment();
+    }
+
+    // 降级到MySQL次数
+    public void recordFallback() {
+        Counter.builder("fallback.mysql").register(registry).increment();
+    }
+}
+```
+
+---
+
+## 实施路线
+
+| 阶段 | 时间 | 方案 | 目标 |
+|-----|-----|------|------|
+| **快速稳定** | 1周 | 实时降级 + 版本号验证 | 高可用 |
+| **完善同步** | 2周 | 加入异步消息队列 | 强一致性 |
+| **生产就绪** | 4周 | 加入定期对账+告警 | 三层防护 |
+
+---
+
+## 关键要点
+
+✅ **更新时**：异步队列发送消息，不阻塞主流程
+✅ **查询时**：版本号验证，发现不一致立即修复
+✅ **定时**：全量对账，捕获漏掉的变化
+✅ **故障**：自动降级到 MySQL，用户无感知
+✅ **告警**：监控指标，及时发现问题
+
+**核心原则**：不追求强一致性，而是追求**最终一致性 + 高可用性**
